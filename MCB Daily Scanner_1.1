@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# mcb_daily_scanner FINAL VERSION — by ChatGPT for Joe
+
+import os, time, random
+from datetime import datetime, timedelta
+import requests
+import pandas as pd
+import numpy as np
+
+# ========= CONFIG =========
+EOD_API_KEY = "691549a40cbbd7.99440931"
+USE_EOD = True
+
+TELEGRAM_TOKEN = "8074680946:AAFshgFINNVlVYJFl88-E9z_o8Zj-KsfRSs"
+TELEGRAM_CHAT_ID = "6027645130"
+
+STOCK_LIST = [
+    "AAPL.US","MSFT.US","NVDA.US","AMZN.US","GOOG.US","META.US",
+    "TSLA.US","AVGO.US","JPM.US","BRK-B.US","V.US","MA.US",
+    "HD.US","COST.US","WMT.US","MCD.US","KO.US","PEP.US",
+    "NFLX.US","AMD.US","QCOM.US","INTC.US","TXN.US",
+    "UNH.US","JNJ.US","MRK.US","ABBV.US","PFE.US",
+    "XOM.US","CVX.US","COP.US","SLB.US",
+    "CAT.US","DE.US","GE.US","UPS.US","FDX.US","BA.US",
+    "LOW.US","TGT.US","SBUX.US","NKE.US","ADBE.US",
+    "CRM.US","ORCL.US","IBM.US","CSCO.US","AMAT.US"
+]
+
+CHANNEL_LEN = 9
+AVG_LEN = 12
+ENTRY1 = -35
+ENTRY2 = -60
+
+LOOKBACK_DAYS = 180
+CHECK_WINDOW_DAYS = 7
+RECENT_SHOW_DAYS = 7
+
+# Output folder
+OUT_DIR = "/Users/joechan/Documents/mcb_signals"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ========= EODHD fetch =========
+def eodhd_fetch(symbol, from_date, to_date):
+    url = f"https://eodhistoricaldata.com/api/eod/{symbol}"
+    params = {
+        "from": from_date,
+        "to": to_date,
+        "api_token": EOD_API_KEY,
+        "period": "d",
+        "fmt": "json"
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+        df = pd.DataFrame(data)
+        df.rename(columns={
+            "date":"Date","open":"Open","high":"High","low":"Low","close":"Close",
+            "adjusted_close":"Adj Close","volume":"Volume"
+        }, inplace=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+        for c in ["Open","High","Low","Close"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["Open","High","Low","Close"])
+        df.sort_values("Date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+    except:
+        return None
+
+# ========= MCB calculation =========
+def compute_mcb(df):
+    ap = (df["High"] + df["Low"] + df["Close"]) / 3
+    esa = ap.ewm(span=CHANNEL_LEN).mean()
+    d = abs(ap - esa).ewm(span=CHANNEL_LEN).mean()
+    ci = (ap - esa) / (0.015 * d.replace(0, 1e-9))
+    tci = ci.ewm(span=AVG_LEN).mean()
+    df["wt1"] = tci
+    df["wt2"] = df["wt1"].rolling(4).mean()
+    return df
+
+# ========= Telegram =========
+def telegram_send(text):
+    if not TELEGRAM_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown"})
+        return r.status_code == 200
+    except:
+        return False
+
+# ========= MAIN SCANNER =========
+def scan_once():
+    today = datetime.now().date()
+    today_str = today.strftime("%Y-%m-%d")
+
+    from_dt = today - timedelta(days=LOOKBACK_DAYS)
+    df_all = []
+
+    for sym in STOCK_LIST:
+
+        df = eodhd_fetch(sym,
+                         from_dt.strftime("%Y-%m-%d"),
+                         today_str)
+
+        if df is None:
+            continue
+
+        df = compute_mcb(df).dropna().reset_index(drop=True)
+
+        df["cross"] = (df["wt1"].shift(1) < df["wt2"].shift(1)) & (df["wt1"] > df["wt2"])
+        df["green_dot"] = df["cross"] & ((df["wt2"] - df["wt1"]) <= 0)
+        df["buy1"] = (df["green_dot"] & (df["wt1"] < ENTRY1)).astype(int)
+        df["buy2"] = (df["green_dot"] & (df["wt1"] < ENTRY2)).astype(int)
+
+        recent_df = df.tail(CHECK_WINDOW_DAYS + 1)
+
+        for _, row in recent_df.iterrows():
+            if row["buy2"] == 1 or row["buy1"] == 1:
+                df_all.append({
+                    "symbol": sym,
+                    "signal_type": "2x" if row["buy2"] == 1 else "1x",
+                    "signal_date": row["Date"].strftime("%Y-%m-%d"),
+                    "wt1": float(row["wt1"])
+                })
+
+    if not df_all:
+        print("No signals.")
+        return
+
+    df_out = pd.DataFrame(df_all)
+    df_out = df_out.sort_values("signal_date", ascending=False)
+
+    # ---- Split TODAY / PAST ----
+    # ---- Split TODAY / PAST (FIXED) ----
+    yesterday = today - timedelta(days=1)
+    yesterday_str = yesterday.strftime("%Y-%m-%d")
+
+    # “今日最新信號” = 昨天 (市場最後一根K)
+    df_today = df_out[df_out["signal_date"] == yesterday_str]
+
+    # “過去信號” = 比昨天更早的
+    df_past = df_out[df_out["signal_date"] < yesterday_str]
+
+    out_file = f"{OUT_DIR}/signals_{today.strftime('%Y%m%d')}.csv"
+    df_out.to_csv(out_file, index=False, float_format="%.6f")
+
+    # ===== Summary Text =====
+    summary = f"📌 *MCB Scanner* {today_str}\n"
+
+    if len(df_today):
+        summary += "\n🔥 *今日最新信號* 🔥\n"
+        for _, r in df_today.iterrows():
+            summary += f"{r['symbol']}  {r['signal_type']}  (wt1={r['wt1']:.1f})\n"
+    else:
+        summary += "\n(今日無新信號)\n"
+
+    if len(df_past):
+        summary += "\n📅 *過去 6 日信號*\n"
+        for _, r in df_past.iterrows():
+            summary += f"{r['symbol']} {r['signal_type']} @ {r['signal_date']} (wt1={r['wt1']:.1f})\n"
+
+    # save summary
+    with open(f"{OUT_DIR}/signals_{today.strftime('%Y%m%d')}_summary.txt", "w") as f:
+        f.write(summary)
+
+    sent = telegram_send(summary)
+    if sent:
+        print("TG sent.")
+
+    print(f"Saved CSV: {out_file}")
+    print("Done.")
+
+# ========= RUN =========
+if __name__ == "__main__":
+    print("MCB Daily Scanner FINAL starting:", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    scan_once()
