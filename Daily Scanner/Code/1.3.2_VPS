@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-# MCB Daily Scanner v1.3
-# Only EOD  Data
-# 2025-11-14 修復丟失前天數據
+# MCB Daily Scanner v1.3.2 (EOD-only) 
+# 2025-11-14 
+# Fix：恢復足夠歷史、避免過早 dropna、按實際 K 棒檢查最近訊號 修正歷史窗口與 recent-row 篩選邏輯
 
-import os
-import time
-import random
-import json
+import os, time, random, json
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
 # ========== CONFIG ==========
-EOD_API_KEY = "69169ed4d171d2.32964392"   # ★ EOD API key
+EOD_API_KEY = "69169ed4d171d2.32964392"   # ★ 你的 EOD API key
+#  q79066774 gmail   691549a40cbbd7.99440931
+#  888@af888.top   69169ed4d171d2.32964392
+#  joe@af888.top   6916c6b0c37948.34099377
+
 USE_EOD = True
 
 TELEGRAM_TOKEN = "8074680946:AAFshgFINNVlVYJFl88-E9z_o8Zj-KsfRSs"
 TELEGRAM_CHAT_ID = "6027645130"
 
-# List
+# Symbol list (維持你常用的 50 檔，請以 EOD 可接受的格式為準)
 STOCK_LIST = [
     "AAPL.US","MSFT.US","NVDA.US","AMZN.US","GOOG.US","META.US",
     "TSLA.US","AVGO.US","JPM.US","BRK-B.US","V.US","MA.US",
@@ -32,83 +33,80 @@ STOCK_LIST = [
     "CRM.US","ORCL.US","IBM.US","CSCO.US","AMAT.US"
 ]
 
-# MCB Config
+# MCB parameters
 CHANNEL_LEN = 9
 AVG_LEN = 12
-ENTRY1 = -35.0   # buy1 閾值
-ENTRY2 = -60.0   # buy2 閾值
+ENTRY1 = -35.0
+ENTRY2 = -60.0
 
-# 時間與輸出配置
-LOOKBACK_DAYS = 30        # 往回抓多少日的原始歷史資料（越大越穩）
-CHECK_WINDOW_DAYS = 5      # 檢查最近幾日內是否出現過訊號（含昨天）
-OUT_DIR = os.path.expanduser("~/mcb_signals")   # 儲存輸出位置
+# time / output config
+LOOKBACK_DAYS = 180       # **重要**：恢復 180 或更長，避免指標抖動
+CHECK_WINDOW_DAYS = 7     # 檢查最近多少個交易日（以 K 棒數計）
+OUT_DIR = os.path.expanduser("~/mcb_signals")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# EOD fetch 設定
+# EOD fetch
 EOD_RETRIES = 3
-EOD_TIMEOUT = 15  # seconds
+EOD_TIMEOUT = 12
 
-# ========== helper: EODHD fetch (retry) ==========
+# ========== helper: EODHD fetch ==========
 def eodhd_fetch(symbol, from_date, to_date, retries=EOD_RETRIES):
     url = f"https://eodhistoricaldata.com/api/eod/{symbol}"
     params = {
-        "from": from_date,
-        "to": to_date,
-        "api_token": EOD_API_KEY,
-        "period": "d",
-        "fmt": "json"
+        "from": from_date, "to": to_date,
+        "api_token": EOD_API_KEY, "period": "d", "fmt": "json"
     }
     last_err = None
     for attempt in range(1, retries+1):
         try:
             r = requests.get(url, params=params, timeout=EOD_TIMEOUT)
             if r.status_code != 200:
-                last_err = f"HTTP {r.status_code} {r.text[:200]}"
-                time.sleep(0.5 + random.random()*1.0)
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                time.sleep(0.4 + random.random()*0.8)
                 continue
             data = r.json()
             if not isinstance(data, list) or len(data) == 0:
-                last_err = "Empty or invalid JSON"
-                time.sleep(0.5 + random.random()*1.0)
+                last_err = "Empty JSON or unexpected format"
+                time.sleep(0.4 + random.random()*0.8)
                 continue
             df = pd.DataFrame(data)
-            # standardize columns
             df.rename(columns={
                 "date":"Date","open":"Open","high":"High","low":"Low","close":"Close",
                 "adjusted_close":"Adj Close","volume":"Volume"
             }, inplace=True)
-            # coerce numeric
+            # coerce numeric and parse date
             for c in ["Open","High","Low","Close"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.dropna(subset=["Open","High","Low","Close"])
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date","Open","High","Low","Close"])
             df.sort_values("Date", inplace=True)
             df.reset_index(drop=True, inplace=True)
             return df
         except Exception as e:
             last_err = str(e)
-            time.sleep(0.5 + random.random()*1.0)
-    # all retries failed
+            time.sleep(0.4 + random.random()*0.8)
     print(f"[EODHD] {symbol} fetch failed after {retries} attempts: {last_err}")
     return None
 
-# ========== MCB computation ==========
+# ========== MCB calculation ==========
 def compute_mcb(df):
+    # expects df sorted by Date ascending
     ap = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    esa = ap.ewm(span=CHANNEL_LEN).mean()
-    d = abs(ap - esa).ewm(span=CHANNEL_LEN).mean()
+    esa = ap.ewm(span=CHANNEL_LEN, adjust=False).mean()
+    d = (ap - esa).abs().ewm(span=CHANNEL_LEN, adjust=False).mean()
     safeD = d.replace(0, 1e-9)
     ci = (ap - esa) / (0.015 * safeD)
-    tci = ci.ewm(span=AVG_LEN).mean()
+    tci = ci.ewm(span=AVG_LEN, adjust=False).mean()
+    df = df.copy()
     df["wt1"] = tci
-    df["wt2"] = df["wt1"].rolling(4).mean()
+    df["wt2"] = df["wt1"].rolling(4, min_periods=1).mean()
     return df
 
-# ========== Telegram send ==========
+# ========== Telegram ==========
 def telegram_send(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TG] token/chat_id not set, skip sending.")
+        print("[TG] token/chat_id missing, skip")
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -122,46 +120,43 @@ def telegram_send(text):
         print("[TG] exception:", e)
         return False
 
-# ========== Main scanner ==========
+# ========== main scan ==========
 def scan_once():
     run_time = datetime.now()
     run_time_str = run_time.strftime("%Y-%m-%d %H:%M")
     today = run_time.date()
     yesterday = today - timedelta(days=1)
-    trade_date_str = yesterday.strftime("%Y-%m-%d")
+    trading_day_str = yesterday.strftime("%Y-%m-%d")
 
-    from_dt = today - timedelta(days=LOOKBACK_DAYS)
-    from_s = from_dt.strftime("%Y-%m-%d")
-    to_s = yesterday.strftime("%Y-%m-%d")  # NOTE: we scan up to yesterday inclusive
+    from_date = (today - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    to_date = yesterday.strftime("%Y-%m-%d")
 
-    print(f">>> MCB Scanner run at {run_time_str} (using trading day up to {to_s})")
+    print(f">>> MCB Scanner run at {run_time_str} (data up to {to_date})")
     all_signals = []
 
     for sym in STOCK_LIST:
         try:
-            df = eodhd_fetch(sym, from_s, to_s)
-            if df is None:
-                # fetch failed, skip symbol
+            df = eodhd_fetch(sym, from_date, to_date)
+            if df is None or df.shape[0] < 10:
+                print(f"[{sym}] no data or insufficient rows ({None if df is None else df.shape[0]})")
                 continue
-            df = compute_mcb(df).dropna().reset_index(drop=True)
 
-            # cross / green_dot / buy1 / buy2
+            df = compute_mcb(df)   # **不要在這裡 dropna**
+            # now drop rows where wt1 is NaN (very early rows)
+            df = df.dropna(subset=["wt1"]).reset_index(drop=True)
+
+            # compute signals on full df
             df["cross"] = (df["wt1"].shift(1) < df["wt2"].shift(1)) & (df["wt1"] > df["wt2"])
             df["green_dot"] = df["cross"] & ((df["wt2"] - df["wt1"]) <= 0)
             df["buy1"] = (df["green_dot"] & (df["wt1"] < ENTRY1)).astype(int)
             df["buy2"] = (df["green_dot"] & (df["wt1"] < ENTRY2)).astype(int)
 
-            # window by date (include yesterday and the previous CHECK_WINDOW_DAYS-1 days)
-            window_start = yesterday - timedelta(days=CHECK_WINDOW_DAYS-1)
-            recent_mask = (df["Date"] >= pd.to_datetime(window_start)) & (df["Date"] <= pd.to_datetime(yesterday))
-            recent_df = df.loc[recent_mask].copy()
-
-            if recent_df.empty:
-                # no data in the window (maybe symbol has no recent trading), skip
+            # we check LAST CHECK_WINDOW_DAYS trading bars (actual rows)
+            if df.shape[0] == 0:
                 continue
-
-            # iterate rows in chronological order (oldest -> newest)
-            for _, row in recent_df.iterrows():
+            recent = df.tail(CHECK_WINDOW_DAYS)  # last N trading rows
+            # iterate from newest -> oldest or oldest->newest (we'll collect oldest->newest for grouping)
+            for _, row in recent.iterrows():
                 if int(row.get("buy2", 0)) == 1 or int(row.get("buy1", 0)) == 1:
                     all_signals.append({
                         "symbol": sym,
@@ -173,81 +168,74 @@ def scan_once():
         except Exception as e:
             print(f"[ERR] {sym} processing error: {e}")
 
-    # if no signals found overall
+    # if no signals found
     if not all_signals:
-        header = f"📌 MCB Scanner — {run_time_str}\n\nLatest trading day used: {trade_date_str}\n\n"
-        header += "(No buy signals yesterday)\n\n"
-        header += f"Checked last {CHECK_WINDOW_DAYS} trading days (up to {trade_date_str})."
+        header = f"📌 MCB Scanner — {run_time_str}\n\nLatest trading day used: {trading_day_str}\n\n"
+        header += "(No buy signals in the checked window)\n\n"
+        header += f"Checked last {CHECK_WINDOW_DAYS} trading bars for {len(STOCK_LIST)} symbols."
         telegram_send(header)
         print("No signals found. Heartbeat sent.")
-        # still save an empty csv for record
-        out_file = os.path.join(OUT_DIR, f"signals_{trade_date_str}.csv")
+        # save empty csv for record
+        out_file = os.path.join(OUT_DIR, f"signals_{trading_day_str}.csv")
         pd.DataFrame(columns=["symbol","signal_type","signal_date","price","wt1"]).to_csv(out_file, index=False)
         return
 
-    # make dataframe of signals
     df_out = pd.DataFrame(all_signals)
-    # sort: newest date first, then symbol
     df_out = df_out.sort_values(["signal_date","symbol"], ascending=[False, True]).reset_index(drop=True)
 
     # split yesterday vs past
-    df_yesterday = df_out[df_out["signal_date"] == trade_date_str].copy()
-    df_past = df_out[df_out["signal_date"] < trade_date_str].copy()
+    df_yesterday = df_out[df_out["signal_date"] == trading_day_str].copy()
+    df_past = df_out[df_out["signal_date"] < trading_day_str].copy()
 
-    # save CSV and JSON
-    out_file = os.path.join(OUT_DIR, f"signals_{trade_date_str}.csv")
+    # save CSV / JSON
+    out_file = os.path.join(OUT_DIR, f"signals_{trading_day_str}.csv")
+    json_file = os.path.join(OUT_DIR, f"signals_{trading_day_str}.json")
     df_out.to_csv(out_file, index=False, float_format="%.6f")
-    json_file = os.path.join(OUT_DIR, f"signals_{trade_date_str}.json")
     with open(json_file, "w") as f:
-        json.dump(all_signals, f, indent=2)
+        json.dump(all_signals, f, indent=2, ensure_ascii=False)
 
-    # Build Telegram message with exact format you requested
-    lines = []
-    lines.append(f"📌 **MCB Auto Scanner** — {run_time_str}")
+    # Build pretty Telegram text (your preferred format)
+    header = f"📌 MCB Scanner — {run_time_str}\n\n🗓 Latest trading day used: {trading_day_str} (signals below)\n"
+    lines = [header]
 
     if df_yesterday.empty:
-        lines.append("(**NO SIGNALS YESTERDAY**)\n")
+        lines.append("\n（No buy signals yesterday）\n")
     else:
-        lines.append("🔥 Signals Yesterday:\n")
+        lines.append("\n🔥 Yesterday's signals (latest trading day):\n")
+        # show each with price
         for _, r in df_yesterday.iterrows():
-            lines.append(f"{r['symbol']} {r['signal_type']} @ ${r['price']:.2f}")
-        lines.append("")  # blank line
+            lines.append(f"• {r['symbol']} {r['signal_type']} @ ${r['price']:.2f}")
 
-    # Past signals grouped by date (descending)
     if not df_past.empty:
-        lines.append("📅 **PAST WEEK**\n")
+        lines.append("\n\n📅 Signals Past Week:\n")
         grouped = df_past.groupby("signal_date")
-        # order by date descending:
         dates = sorted(grouped.groups.keys(), reverse=True)
         for d in dates:
-            lines.append(f"• {d}")
+            lines.append(f"\n• {d}")
             grp = grouped.get_group(d)
-            # build list of items for this date
-            items = []
-            for _, r in grp.iterrows():
-                items.append(f"{r['symbol']} {r['signal_type']} @ ${r['price']:.2f}")
-            # join items with ', ' and add trailing comma as your format
+            # join items with comma and line breaks for readability
+            items = [f"{row['symbol']} {row['signal_type']} @ ${row['price']:.2f}" for _, row in grp.iterrows()]
+            # put items each on its own line (or join with comma as you like)
             for it in items:
-                lines.append(f"{it},")
-            lines.append("")  # blank line between dates
+                lines.append(f"  - {it}")
 
     text = "\n".join(lines)
-    # Save summary text
-    summary_file = os.path.join(OUT_DIR, f"signals_{trade_date_str}_summary.txt")
-    with open(summary_file, "w") as f:
+
+    # save summary
+    summary_file = os.path.join(OUT_DIR, f"signals_{trading_day_str}_summary.txt")
+    with open(summary_file, "w", encoding="utf-8") as f:
         f.write(text)
 
     sent = telegram_send(text)
     if sent:
         print("TG sent.")
     else:
-        print("TG failed (check token/chat_id).")
+        print("TG failed.")
 
     print(f"Saved CSV: {out_file}")
     print(f"Saved JSON: {json_file}")
     print("Done.")
 
-# ========== Run ==========
 if __name__ == "__main__":
     print("MCB Daily Scanner (EOD-only) starting:", datetime.now().strftime("%Y-%m-%d %H:%M"))
     scan_once()
