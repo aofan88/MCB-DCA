@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+# MCB Daily Scanner v1.3.4 — UI A 
+# 2025-11-14 by ChatGPT for Joe
+# Fix:修改數據獲取長度 修改複雜款A版UI 數據基本無錯
+
+import os, time, random, json
+from datetime import datetime, timedelta
+import requests
+import pandas as pd
+import numpy as np
+
+
+# ========== CONFIG (直接修改這邊) ==========
+EOD_API_KEY = "69169ed4d171d2.32964392"   # ← 替換為你的 EOD key
+USE_EOD = True
+
+TELEGRAM_TOKEN = "8074680946:AAFshgFINNVlVYJFl88-E9z_o8Zj-KsfRSs"  # ← 你的 bot token
+TELEGRAM_CHAT_ID = "6027645130"  # ← 你的 chat_id
+
+# 請把輸出資料夾設定到 VPS 上你想要的路徑
+OUT_DIR = "/root/mcb_signals"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 股票清單（EOD 格式）
+STOCK_LIST = [
+    "AAPL.US","MSFT.US","NVDA.US","AMZN.US","GOOG.US","META.US",
+    "TSLA.US","AVGO.US","JPM.US","BRK-B.US","V.US","MA.US",
+    "HD.US","COST.US","WMT.US","MCD.US","KO.US","PEP.US",
+    "NFLX.US","AMD.US","QCOM.US","INTC.US","TXN.US",
+    "UNH.US","JNJ.US","MRK.US","ABBV.US","PFE.US",
+    "XOM.US","CVX.US","COP.US","SLB.US",
+    "CAT.US","DE.US","GE.US","UPS.US","FDX.US","BA.US",
+    "LOW.US","TGT.US","SBUX.US","NKE.US","ADBE.US",
+    "CRM.US","ORCL.US","IBM.US","CSCO.US","AMAT.US"
+]
+
+# MCB (保持原始參數)
+CHANNEL_LEN = 9
+AVG_LEN = 12
+ENTRY1 = -35.0
+ENTRY2 = -60.0
+
+# 時間設定（保留掃描 WINDOW = 5）
+LOOKBACK_DAYS = 200        # 抓 180 日歷史（用於 EMA 穩定）
+CHECK_WINDOW_DAYS = 10      # 真正用於判斷的「最近交易棒數」 —— **保留為 5**
+UI_SHOW_DAYS = 5           # 但 UI 只顯示最近幾個交易日（你選擇只顯示 3）
+EOD_RETRIES = 3
+EOD_TIMEOUT = 12
+
+# API call 節流
+MIN_WAIT_BETWEEN_CALLS = 0.25
+MAX_WAIT_BETWEEN_CALLS = 0.8
+
+# ========== EOD fetch (robust with retries) ==========
+def eodhd_fetch(symbol, from_date, to_date, retries=EOD_RETRIES):
+    url = f"https://eodhistoricaldata.com/api/eod/{symbol}"
+    params = {
+        "from": from_date,
+        "to": to_date,
+        "api_token": EOD_API_KEY,
+        "period": "d",
+        "fmt": "json"
+    }
+    last_err = None
+    for attempt in range(1, retries+1):
+        try:
+            r = requests.get(url, params=params, timeout=EOD_TIMEOUT)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code} {r.text[:200]}"
+                time.sleep(0.4 + random.random() * 0.6)
+                continue
+            data = r.json()
+            if not isinstance(data, list) or len(data) == 0:
+                last_err = "Empty or invalid JSON"
+                time.sleep(0.4 + random.random() * 0.6)
+                continue
+            df = pd.DataFrame(data)
+            df.rename(columns={
+                "date":"Date","open":"Open","high":"High","low":"Low","close":"Close",
+                "adjusted_close":"Adj Close","volume":"Volume"
+            }, inplace=True)
+            for c in ["Open","High","Low","Close"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date","Open","High","Low","Close"])
+            df.sort_values("Date", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            return df
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.4 + random.random() * 0.6)
+    print(f"[EODHD] {symbol} fetch failed after {retries} attempts: {last_err}")
+    return None
+
+# ========== MCB compute (完全保留 1.3.1 的算法) ==========
+def compute_mcb(df):
+    ap = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    # 與 1.3.1 保持一致：ema 的用法（adjust False）
+    esa = ap.ewm(span=CHANNEL_LEN, adjust=False).mean()
+    d = (ap - esa).abs().ewm(span=CHANNEL_LEN, adjust=False).mean()
+    safeD = d.replace(0, 1e-9)
+    ci = (ap - esa) / (0.015 * safeD)
+    tci = ci.ewm(span=AVG_LEN, adjust=False).mean()
+    df2 = df.copy()
+    df2["wt1"] = tci
+    df2["wt2"] = df2["wt1"].rolling(4, min_periods=1).mean()
+    return df2
+
+# ========== Telegram helper ==========
+def telegram_send(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TG] token/chat_id missing - skip send")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown"}, timeout=10)
+        if r.status_code != 200:
+            print("[TG] send failed:", r.status_code, r.text[:200])
+            return False
+        return True
+    except Exception as e:
+        print("[TG] exception:", e)
+        return False
+
+# ========== 主掃描程序（保留原邏輯） ==========
+def scan_once():
+    # run time (local), but latest trading day used = yesterday
+    run_time_local = datetime.now()
+    run_time_str = run_time_local.strftime("%Y-%m-%d %H:%M")
+    today_local = run_time_local.date()
+    yesterday = today_local - timedelta(days=1)
+    latest_trading_day = yesterday.strftime("%Y-%m-%d")
+
+    from_date = (today_local - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    to_date = yesterday.strftime("%Y-%m-%d")  # scan up to yesterday inclusive
+
+    print(f">>> MCB Scanner run at {run_time_str} (using trading data up to {to_date})")
+
+    all_signals = []
+    stats = {"checked":0, "fetch_fail":0, "signals":0, "2x":0, "1x":0}
+
+    for sym in STOCK_LIST:
+        stats["checked"] += 1
+        df = eodhd_fetch(sym, from_date, to_date)
+        # throttle
+        time.sleep(MIN_WAIT_BETWEEN_CALLS + random.random()*(MAX_WAIT_BETWEEN_CALLS-MIN_WAIT_BETWEEN_CALLS))
+        if df is None or df.shape[0] < 8:
+            stats["fetch_fail"] += 1
+            # print(f"[{sym}] fetch failed or insufficient rows.")
+            continue
+
+        df_mcb = compute_mcb(df)
+        df_mcb = df_mcb.dropna(subset=["wt1"]).reset_index(drop=True)
+
+        # following 1.3.1 logic exactly
+        df_mcb["cross"] = (df_mcb["wt1"].shift(1) < df_mcb["wt2"].shift(1)) & (df_mcb["wt1"] > df_mcb["wt2"])
+        df_mcb["green_dot"] = df_mcb["cross"] & ((df_mcb["wt2"] - df_mcb["wt1"]) <= 0)
+        df_mcb["buy1"] = (df_mcb["green_dot"] & (df_mcb["wt1"] < ENTRY1)).astype(int)
+        df_mcb["buy2"] = (df_mcb["green_dot"] & (df_mcb["wt1"] < ENTRY2)).astype(int)
+
+        # select recent WINDOW (CHECK_WINDOW_DAYS) by trading bars (rows) — keep as original 5
+        recent_df = df_mcb.tail(CHECK_WINDOW_DAYS).copy()
+        if recent_df.empty:
+            continue
+
+        # iterate in chronological order to preserve ordering
+        for _, row in recent_df.iterrows():
+            b2 = int(row.get("buy2", 0))
+            b1 = int(row.get("buy1", 0))
+            if b2 or b1:
+                signal_type = "2x" if b2 else "1x"
+                stats["signals"] += 1
+                if b2: stats["2x"] += 1
+                else: stats["1x"] += 1
+                all_signals.append({
+                    "symbol": sym,
+                    "signal_type": signal_type,
+                    "signal_date": row["Date"].strftime("%Y-%m-%d"),
+                    "close": float(row["Close"]),
+                    "wt1": float(row["wt1"]),
+                    "wt2": float(row["wt2"])
+                })
+
+    # after scanning all symbols
+    # save CSV/JSON even當沒有signals也要保存空檔
+    df_signals = pd.DataFrame(all_signals)
+    if not df_signals.empty:
+        df_signals = df_signals.sort_values(["signal_date","symbol"], ascending=[False, True]).reset_index(drop=True)
+    else:
+        df_signals = pd.DataFrame(columns=["symbol","signal_type","signal_date","close","wt1","wt2"])
+
+    csv_path = os.path.join(OUT_DIR, f"signals_{latest_trading_day}.csv")
+    json_path = os.path.join(OUT_DIR, f"signals_{latest_trading_day}.json")
+    summary_path = os.path.join(OUT_DIR, f"signals_{latest_trading_day}_summary.txt")
+
+    df_signals.to_csv(csv_path, index=False, float_format="%.6f")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(all_signals, f, indent=2, ensure_ascii=False)
+
+    # ---------- Build UI A style message (only display latest UI_SHOW_DAYS days) ----------
+    header = []
+    header.append("📊 **RunSing-MCB Daily Scanner Report**")
+    header.append(f"🕒 Generated at: {run_time_str}")
+    header.append(f"🗓 Latest Trading Day: {latest_trading_day}")
+    header.append("\n━━━━━━━━━━━━━━━━━━")
+
+    # Yesterday latest signals (from df_signals)
+    yesterday_df = df_signals[df_signals["signal_date"] == latest_trading_day].copy()
+    # Past grouped signals (all earlier days within CHECK_WINDOW_DAYS)
+    past_df = df_signals[df_signals["signal_date"] < latest_trading_day].copy()
+
+    # Prepare yesterday block
+    body = []
+    body.append("🔥 **昨日最新買入信號**")
+    if yesterday_df.empty:
+        body.append("（昨日無新信號）\n")
+    else:
+        # list each yesterday signal as card
+        for _, r in yesterday_df.iterrows():
+            body.append(f"• {r['symbol']} — **{r['signal_type']} Buy**  ")
+            body.append(f"  Signal Date: {r['signal_date']}  ")
+            body.append(f"  Close: **${r['close']:.2f}**  ")
+            body.append(f"  WT1: {r['wt1']:.1f}\n")
+
+    # Prepare recent N days block (UI_SHOW_DAYS)
+    body.append("━━━━━━━━━━━━━━━━━━")
+    body.append(f"📅 **最近 {UI_SHOW_DAYS} 個交易日信號 **")
+    body.append("━━━━━━━━━━━━━━━━━━\n")
+
+    if past_df.empty:
+        # if no past signals, show nothing (still keep header)
+        body.append("(無過去紀錄)\n")
+    else:
+        # group past_df by date descending, but only keep most recent UI_SHOW_DAYS unique dates
+        grouped = past_df.groupby("signal_date")
+        unique_dates = sorted(grouped.groups.keys(), reverse=True)
+        # pick up to UI_SHOW_DAYS dates
+        show_dates = unique_dates[:UI_SHOW_DAYS]
+        if not show_dates:
+            body.append("(無過去紀錄)\n")
+        else:
+            for d in show_dates:
+                body.append(f"**{d}**")
+                grp = grouped.get_group(d)
+                # for each item in date: symbol — type @ $price
+                for _, r in grp.iterrows():
+                    body.append(f"• {r['symbol']} — {r['signal_type']} @ ${r['close']:.2f}")
+                body.append("")  # blank line between dates
+
+    # stats block
+    body.append("━━━━━━━━━━━━━━━━━━")
+    body.append("📉 **系統統計摘要**")
+    body.append("━━━━━━━━━━━━━━━━━━\n")
+    total_recent_signals = stats["signals"]
+    pct_2x = (stats["2x"] / total_recent_signals * 100.0) if total_recent_signals else 0.0
+    body.append(f"• 近 {UI_SHOW_DAYS} 日總信號數（窗口內共計）: {total_recent_signals}")
+    body.append(f"• 強信號（2×）佔比: {pct_2x:.1f}%")
+    body.append(f"• 數據來源: EODHD")
+    body.append(f"• 模型: Market Cipher B by Joe\n")
+
+    # conclusion
+    body.append("━━━━━━━━━━━━━━━━━━")
+    body.append("🏁 **結語**")
+    body.append("━━━━━━━━━━━━━━━━━━")
+    body.append("本報告由 *MCB Auto Scanner* 自動生成，")
+    body.append("本系統僅捕捉「**機會出現的瞬間**」，是否執行進場由你自由判斷。")
+
+    # combine header + body
+    message_lines = header + ["\n"] + body
+    message_text = "\n".join(message_lines)
+
+    # save summary file (plain text)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(message_text)
+
+    # always send (heartbeat even if empty)
+    sent = telegram_send(message_text)
+    if sent:
+        print("TG sent.")
+    else:
+        print("TG failed (check token/chat_id).")
+
+    print(f"Saved CSV: {csv_path}")
+    print(f"Saved JSON: {json_path}")
+    print(f"Saved summary: {summary_path}")
+    print("Done.")
+
+# ========== RUN ==========
+if __name__ == "__main__":
+    print("MCB Daily Scanner v1.3.4 UI-A starting:", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    scan_once()
