@@ -1,0 +1,162 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+from datetime import datetime
+from itertools import groupby
+
+# ================= 配置區域 =================
+
+# 1. Telegram 設定
+TG_BOT_TOKEN = '你的_TG_BOT_TOKEN' 
+TG_CHAT_ID = '你的_TG_CHAT_ID'
+
+# 2. 觀察清單 (55+ 優質標的)
+TICKERS = [
+    'QQQ', 'SPY', 'DIA', 'IWM', 'SMH', 'VIG', 'XLV', 'XLF',
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'NFLX', 'ADBE', 'CRM', 'ORCL',
+    'AMD', 'AVGO', 'QCOM', 'TXN', 'INTC', 'MU',
+    'WMT', 'COST', 'TGT', 'HD', 'LOW', 'MCD', 'SBUX', 'NKE', 'KO', 'PEP', 'PG',
+    'JPM', 'BAC', 'V', 'MA', 'AXP', 'BLK', 'GS',
+    'LLY', 'UNH', 'JNJ', 'ABBV', 'MRK',
+    'CAT', 'XOM', 'CVX',
+    'COIN', 'MSTR'
+]
+
+# 3. 策略參數
+N1 = 9
+N2 = 12
+LEVEL_1_BUY = -35  # 普通買入 (-35)
+LEVEL_2_BUY = -60  # 強力買入 (-60)
+LOOKBACK_DAYS = 7  # 回溯天數
+
+# ================= 核心邏輯 =================
+
+def calculate_mcb(df, n1=9, n2=12):
+    """計算 MCB 指標"""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    source = (df['High'] + df['Low'] + df['Close']) / 3
+    esa = source.ewm(span=n1, adjust=False).mean()
+    d = (source - esa).abs().ewm(span=n1, adjust=False).mean()
+    ci = (source - esa) / (0.015 * d.replace(0, 0.00001))
+    wt1 = ci.ewm(span=n2, adjust=False).mean()
+    wt2 = wt1.rolling(window=4).mean()
+    
+    df['wt1'] = wt1
+    df['wt2'] = wt2
+    return df
+
+def scan_history(ticker):
+    """掃描單個標的過去 N 天的信號"""
+    signals = []
+    try:
+        df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=False)
+        
+        if len(df) < 50:
+            return []
+
+        df = calculate_mcb(df, N1, N2)
+        
+        check_range = df.iloc[-(LOOKBACK_DAYS + 1):]
+        
+        for i in range(1, len(check_range)):
+            curr_row = check_range.iloc[i]
+            prev_row = check_range.iloc[i-1]
+            
+            # 金叉判斷
+            crossover = (prev_row['wt1'] < prev_row['wt2']) and (curr_row['wt1'] >= curr_row['wt2'])
+            
+            if crossover:
+                val = curr_row['wt1']
+                action_str = ""
+                
+                if val < LEVEL_2_BUY:
+                    action_str = "2X" # 強力買入
+                elif val < LEVEL_1_BUY:
+                    action_str = "1X" # 普通買入
+                
+                if action_str:
+                    signals.append({
+                        'ticker': ticker,
+                        'date': curr_row.name.strftime('%Y-%m-%d'),
+                        'price': curr_row['Close'],
+                        'mcb_val': val,
+                        'action': action_str
+                    })
+        return signals
+
+    except Exception as e:
+        print(f"Error scanning {ticker}: {e}")
+        return []
+
+def send_tg_message(message):
+    """發送 TG 消息"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("⚠️ TG 設定未填寫，僅打印結果:")
+        print(message)
+        return
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TG_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML", 
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"TG 發送失敗: {e}")
+
+def generate_report(all_signals):
+    """生成極簡專業風格報告"""
+    
+    report = f"🚀 <b>MCB Scan Report</b>\n"
+    report += f"Date: {datetime.now().strftime('%Y-%m-%d')} | Targets: {len(TICKERS)}\n"
+    report += "======================\n"
+
+    if not all_signals:
+        report += "\nNo signals found in the last 7 days.\n"
+        report += "Market is neutral/high."
+        return report
+
+    # 按日期排序 (新 -> 舊)
+    all_signals.sort(key=lambda x: x['date'], reverse=True)
+    
+    # 按日期分組
+    for date, group in groupby(all_signals, key=lambda x: x['date']):
+        # 日期標題
+        report += f"\n📅 <b>{date}</b>\n"
+        report += "──────────────\n"
+        
+        # 該日期的所有信號
+        for s in group:
+            # 格式: 代碼  [倍數]  $價格  (MCB值)
+            # 例如: MSTR  [2X]  $150.20  (-65.1)
+            
+            # 根據 1X 或 2X 加粗顯示倍數
+            action_display = f"<b>[{s['action']}]</b>"
+            
+            line = f"<b>{s['ticker']:<6}</b> {action_display}  ${s['price']:.2f}  ({s['mcb_val']:.1f})\n"
+            report += line
+        
+    report += "\n======================"
+    
+    return report
+
+# ================= 主程序 =================
+if __name__ == "__main__":
+    print(f"正在掃描 {len(TICKERS)} 個標的...")
+    
+    all_signals = []
+    
+    for ticker in TICKERS:
+        sigs = scan_history(ticker)
+        if sigs:
+            all_signals.extend(sigs)
+    
+    final_report = generate_report(all_signals)
+    send_tg_message(final_report)
+    print("✅ 掃描完成，報告已發送。")
