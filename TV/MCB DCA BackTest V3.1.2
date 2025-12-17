@@ -1,0 +1,158 @@
+// © RunSing_Capital
+// @version=5
+//=====================
+// Dec/17/2025 繼續完善代碼 更新3.1.2
+// Made by Joe
+//=====================
+strategy("[RunSing]MCB DCA BackTest V3.1.2", overlay=true, pyramiding=10000, initial_capital=1000000, default_qty_type=strategy.cash, currency=currency.USD, process_orders_on_close=false)
+
+// ================= 1. 參數設置 =================
+grp_mcb   = "MCB 指標參數"
+n1        = input.int(9, "Channel Length", group=grp_mcb)
+n2        = input.int(12, "Average Length", group=grp_mcb)
+
+grp_logic = "買入閾值"
+level_1   = input.int(-35, "普通買入 (1X)", maxval=0, group=grp_logic)
+level_2   = input.int(-60, "強力買入 (2X)", maxval=0, group=grp_logic)
+
+grp_money = "資金管理"
+amount_1x = input.float(10000, "1X 買入金額 ($)", minval=100, group=grp_money)
+amount_2x = input.float(20000, "2X 買入金額 ($)", minval=100, group=grp_money)
+
+grp_time  = "回測時間範圍"
+useDate   = input.bool(true, "啟用日期限制", group=grp_time)
+startDate = input.time(timestamp("1 Jan 2020 00:00 +0000"), "開始日期", group=grp_time)
+endDate   = input.time(timestamp("1 Jan 2030 00:00 +0000"), "結束日期", group=grp_time)
+
+// ================= 2. 核心計算 =================
+ap = hlc3
+esa = ta.ema(ap, n1)
+d = ta.ema(math.abs(ap - esa), n1)
+ci = (ap - esa) / (0.015 * math.max(d, 1e-10))
+tci = ta.ema(ci, n2)
+wt1 = tci
+wt2 = ta.sma(wt1, 3)
+
+inRange = not useDate or (time >= startDate and time <= endDate)
+crossUp = ta.crossover(wt1, wt2)
+signal_1x = crossUp and wt1 < level_1 and wt1 >= level_2 and inRange
+signal_2x = crossUp and wt1 < level_2 and inRange
+
+// ================= 3. 數據追蹤 (極度安全初始化) =================
+
+// 初始化變量
+var float total_invested = 0.0
+var int count_1x = 0
+var int count_2x = 0
+var float peak_equity = 0.0 // 峰值權益
+var float max_dd_pct = 0.0  // 最大回撤
+var float locked_avg_price = 0.0 // 鎖定的平均成本
+
+// 記錄累計投入與交易次數
+if signal_1x
+    total_invested += amount_1x
+    count_1x += 1
+if signal_2x
+    total_invested += amount_2x
+    count_2x += 1
+
+// ================= 4. 交易執行 (核心邏輯) =================
+if signal_2x
+    strategy.entry("Strong Buy 2X", strategy.long, qty=amount_2x / close, comment="2X")
+else if signal_1x
+    strategy.entry("Buy 1X", strategy.long, qty=amount_1x / close, comment="1X")
+
+// 鎖定持倉成本 (防止平倉後 N/A)
+if strategy.position_size > 0
+    locked_avg_price := strategy.position_avg_price
+
+// 強制平倉
+isLastBar = barstate.islast or (useDate and time > endDate)
+if isLastBar
+    strategy.close_all(comment="Close")
+
+// ================= 5. 高級數據計算 (極度安全獲取) =================
+
+// A. MDD 計算
+float current_equity = strategy.equity
+if peak_equity == 0.0
+    // 在策略開始時，用初始資金安全地初始化峰值
+    peak_equity := strategy.initial_capital 
+
+if time >= startDate
+    // 實時更新峰值權益
+    peak_equity := math.max(peak_equity, current_equity)
+    
+    // 計算回撤百分比
+    float dd = 0.0
+    if peak_equity > 0
+        dd := (peak_equity - current_equity) / peak_equity * 100
+    max_dd_pct := math.max(max_dd_pct, dd)
+
+// B. 真實投資回報率 (Real ROI)
+float real_roi = 0.0
+if total_invested > 0
+    real_roi := (strategy.netprofit / total_invested) * 100
+
+// C. 複合年化收益率 (CAGR)
+float cagr = 0.0
+float days_passed = (math.min(time, endDate) - startDate) / 86400000
+float years_passed = days_passed / 365.25
+float end_value = total_invested + strategy.netprofit
+
+// 至少需要半年時間才能計算 CAGR
+if total_invested > 0 and years_passed > 0.5 and end_value > 0
+    cagr := (math.pow(end_value / total_invested, 1 / years_passed) - 1) * 100
+
+// D. 平均成本顯示字串
+string avg_cost_str = locked_avg_price > 0 ? str.tostring(locked_avg_price, format.mintick) : "N/A"
+
+// ================= 6. 專業儀表板 (極簡無背景，黑字) =================
+
+// UI 樣式：全透明背景，無邊框，黑色文字
+c_trans = color.new(color.black, 100) 
+c_text_main = color.black               // 核心文字：黑色
+c_text_sub  = color.new(color.black, 40)  // 次要文字：深灰色
+c_green     = #089981
+c_red       = color.rgb(208, 3, 3)
+c_blue      = color.rgb(4, 111, 225)
+
+// 調整表格大小為 8 行 (移除夏普比率)
+var table dash = table.new(position.top_right, 2, 8, bgcolor=c_trans, border_width=0)
+
+if barstate.islast
+    // 標題
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 0, "RunSing Strategy Report", text_color=color.black, text_size=size.normal, text_halign=text.align_left)
+    
+    // 1. 真實回報 (ROI)
+    table.cell(dash, 0, 1, "真實回報 (ROI)", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 1, str.tostring(real_roi, "#.##") + "%", text_color=real_roi >= 0 ? c_green : c_red, text_halign=text.align_right)
+
+    // 2. 年化收益 (CAGR)
+    table.cell(dash, 0, 2, "年化收益 (CAGR)", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 2, str.tostring(cagr, "#.##") + "%", text_color=cagr >= 0 ? c_green : c_red, text_halign=text.align_right)
+    
+    // 3. 總淨利潤
+    table.cell(dash, 0, 3, "總淨利潤", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 3, "$" + str.tostring(strategy.netprofit, format.volume), text_color=strategy.netprofit >= 0 ? c_green : c_red, text_halign=text.align_right)
+
+    // 4. 最大回撤 (MDD)
+    table.cell(dash, 0, 4, "最大回撤", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 4, str.tostring(max_dd_pct, "#.##") + "%", text_color=c_red, text_halign=text.align_right)
+
+    // 5. 總投入 
+    table.cell(dash, 0, 5, "總投入本金", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 5, "$" + str.tostring(total_invested, format.volume), text_color=c_text_main, text_halign=text.align_right)
+
+    // 6. 平均成本 
+    table.cell(dash, 0, 6, "平均成本", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 6, "$" + avg_cost_str, text_color=color.rgb(115, 115, 115), text_halign=text.align_right)
+
+    // 7. 交易次數 
+    table.cell(dash, 0, 7, "次數 (1X/2X)", text_color=c_text_sub, text_halign=text.align_left)
+    table.cell(dash, 1, 7, str.tostring(count_1x) + " / " + str.tostring(count_2x), text_color=c_text_main, text_halign=text.align_right)
+
+// ================= 7. 圖表標記 (簡潔版) =================
+plotshape(signal_2x, title="2X", location=location.bottom, color=color.new(color.green, 20), style=shape.triangleup, size=size.tiny)
+plotshape(signal_1x, title="1X", location=location.bottom, color=color.new(color.blue, 20), style=shape.triangleup, size=size.tiny)
