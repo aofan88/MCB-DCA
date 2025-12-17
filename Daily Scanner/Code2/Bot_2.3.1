@@ -3,7 +3,13 @@ import json
 import os
 import asyncio
 import pytz 
-from datetime import datetime, time, timedelta # <-- 確保 datetime 和 timedelta 導入
+from datetime import datetime, time, timedelta
+
+#=================
+# TGBot_2.3.1 帶彩蛋
+# 基本功能沒問題 資產還需要修改 並未篩選完成
+# 等待發掘更多功能
+#=================
 
 # 數據與計算庫
 import yfinance as yf
@@ -11,9 +17,9 @@ import pandas as pd
 import numpy as np
 from itertools import groupby
 
-# Telegram Bot 庫 (v20+)
+# Telegram Bot 庫 (v20+): 新增 MessageHandler 和 filters
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, JobQueue
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, JobQueue, MessageHandler, filters 
 
 # 配置日誌：確保所有輸出都使用標準日誌系統
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -24,8 +30,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 TG_BOT_TOKEN = '8074680946:AAFshgFINNVlVYJFl88-E9z_o8Zj-KsfRSs' 
 
 # 2. 每日自動推送時間 (UTC時間)
-# 美東下午4點收盤約為 UTC 21:00 (冬令時)，設置為 UTC 21:30 確保數據更新
-DAILY_REPORT_TIME = time(hour=1, minute=00, tzinfo=pytz.utc)
+DAILY_REPORT_TIME = time(hour=21, minute=30, tzinfo=pytz.utc)
 
 # 3. 觀察清單 
 TICKERS = [
@@ -57,6 +62,11 @@ USER_DATA_FILE = "users.json"
 # 5. 濫用限制參數
 SCAN_COOLDOWN_SECONDS = 120 # 每個用戶發起掃描的間隔時間 (秒)
 
+# 6. 彩蛋配置 (新增)
+# 使用一個公開的維尼插畫 URL
+WINNIE_POOH_URL = "https://i.ibb.co/DDDVRp2r/IMG-5226.jpg"
+
+
 # ================= 全局追蹤變數 =================
 LAST_SCAN_TIME = {} # 用戶ID: 上次掃描時間 (datetime object)
 
@@ -71,7 +81,7 @@ def log_command(update: Update, command: str):
     username = f"@{user.username}" if user.username else user.full_name
     
     user_info = f"UID:{chat.id} | User: {username}"
-    logging.info(f"[COMMAND] {command:<6} received from {user_info}")
+    logging.info(f"[COMMAND] {command:<10} received from {user_info}") # 將 :<6 改為 :<10 讓日誌對齊
 
 def load_users():
     """從 JSON 載入訂閱用戶"""
@@ -90,24 +100,24 @@ def save_users(users):
 # ================= 核心掃描邏輯 =================
 
 def calculate_mcb(df, n1=9, n2=12):
-    """計算 MCB 指標 (已修復 'false' 拼寫錯誤)"""
+    """計算 MCB 指標"""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     source = (df['High'] + df['Low'] + df['Close']) / 3
-    # 注意：adjust=False 必須是大寫 F
+    # 必須是大寫 F
     esa = source.ewm(span=n1, adjust=False).mean() 
     d = (source - esa).abs().ewm(span=n1, adjust=False).mean()
     ci = (source - esa) / (0.015 * d.replace(0, 0.00001))
     
-    # 注意：adjust=False 必須是大寫 F
+    # 必須是大寫 F
     wt1 = ci.ewm(span=n2, adjust=False).mean() 
     
-    wt2 = wt1.rolling(window=4).mean()
+    wt2 = wt1.rolling(window=3).mean()
     df['wt1'] = wt1; df['wt2'] = wt2
     return df
 
 def run_scan_logic():
-    """執行所有標的掃描並返回報告文本 (已將 print 替換為 logging)"""
+    """執行所有標的掃描並返回報告文本"""
     all_signals = []
     
     logging.info(f"[{datetime.now().strftime('%H:%M:%S')}] 開始執行掃描任務...")
@@ -154,7 +164,6 @@ def run_scan_logic():
                  logging.info(f"[{idx}/{total_tickers}] 掃描 {ticker}: 無信號。")
 
         except Exception as e:
-            # 發生錯誤時記錄到日誌
             logging.error(f"[{idx}/{total_tickers}] 掃描 {ticker}: ❌ 發生錯誤 - {e}")
             continue
 
@@ -163,7 +172,7 @@ def run_scan_logic():
 
     # 生成報告文本
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-    report = f"📊 <b>RunSing</b>-MCB Daily Scanner Report_1.6\n"
+    report = f"📊 <b>RunSing</b>-MCB Scanner Report_Bot2.3\n"
     report += f"🕒 Generated at: {current_time}\n\n"
 
     if not all_signals:
@@ -194,7 +203,7 @@ def run_scan_logic():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """用戶點擊開始或輸入 /start"""
-    # ... (log_command 邏輯不變) ...
+    log_command(update, "/start") 
     
     user_id = update.effective_chat.id
     users = load_users()
@@ -205,47 +214,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- 回覆消息 ---
         await update.message.reply_text(
             "✅ **訂閱成功！**\n您將每天收到 MCB 掃描報告。\n\n"
-            "👉 **快捷鍵提示：** 請點擊左下角菜單，\n"
+            "👉 **使用指南：** 請點擊左下角菜單，\n"
             "或直接點擊或輸入指令，即可使用以下功能：\n"
-            "• /scan - 立即掃描市場\n"
+            "• /scan - 立即掃描\n"
             "• /stop - 取消訂閱\n"
-            "**RunSing-MCB ScanBot 2.1 By Joe**", # 確保兩個星號包裹加粗文本
+            "**RunSing-MCB ScanBot 2.2 By Joe**", # 確保兩個星號包裹加粗文本
             parse_mode='Markdown'
         )
         # --- 修訂後的歡迎訊息結束 ---
-
-
-
-# --- 修改回覆消息從這裡開始 ---
-#        await update.message.reply_text(
-#            "✅ 訂閱成功！\n您將每天收到 MCB 掃描報告。\n\n"
-#            "👉 **快捷鍵提示：** 請點擊聊天輸入框旁的 **/** 符號，\n"
-#            "或直接輸入指令，即可使用以下功能：\n"
-#            "• /scan - 立即掃描市場\n"
-#            "• /stop - 取消訂閱",
-#            parse_mode='Markdown' # 使用 Markdown 讓文字加粗
-#        )
-        # --- 修改回覆消息到這裡結束 ---
         
     else:
-        await update.message.reply_text("手癢癢？再按把你拉黑。輸入 /scan 立即給你掃個最新的。")
+        await update.message.reply_text("手癢癢？再按把你拉黑。點擊 /scan 立即給你掃個最新的。")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """取消訂閱"""
-    log_command(update, "/stop") # 記錄指令
+    log_command(update, "/stop") 
     
     user_id = update.effective_chat.id
     users = load_users()
     if user_id in users:
         users.remove(user_id)
         save_users(users)
-        await update.message.reply_text("❌ 已取消訂閱，您將不再收到潤昇報告。")
+        await update.message.reply_text("❌ 已取消訂閱，再見朋友")
     else:
-        await update.message.reply_text("您尚未訂閱。")
+        await update.message.reply_text("您訂閱了嗎？？？")
 
 async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手動觸發掃描 (帶冷卻時間限制)"""
-    log_command(update, "/scan") # 記錄指令
+    log_command(update, "/scan") 
     
     user_id = update.effective_chat.id
     current_time = datetime.now()
@@ -258,7 +254,7 @@ async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remaining_time = SCAN_COOLDOWN_SECONDS - int(time_since_last_scan.total_seconds())
             
             await update.message.reply_text(
-                f"🚫 **掃描頻率過高！**\n請等待 `{remaining_time}` 秒後再試一次，再頻繁操作把你拉黑。",
+                f"🚫 **掃描頻率過高！**\n請等待 `{remaining_time}` 秒後再試一次，以保護伺服器穩定性。",
                 parse_mode='Markdown'
             )
             return
@@ -266,13 +262,83 @@ async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 通過檢查，更新掃描時間並開始掃描
     LAST_SCAN_TIME[user_id] = current_time
     
-    await update.message.reply_text("⏳ 正在掃描市場，請稍候 (約需 30-60 秒)...")
+    await update.message.reply_text("⏳ 正在掃描美股市場，請稍候 (約需 30-60 秒)...")
     
     # 執行掃描任務 (耗時操作)
     loop = asyncio.get_running_loop()
     report_text = await loop.run_in_executor(None, run_scan_logic)
     
     await update.message.reply_text(report_text, parse_mode='HTML', disable_web_page_preview=True)
+
+# ================= 彩蛋處理 (新增) =================
+
+async def winnie_the_pooh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """彩蛋：發送 '8964' 回覆小熊維尼照片"""
+    log_command(update, "8964_EGG") 
+
+    try:
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=WINNIE_POOH_URL,
+            caption="🍯 想吃蜂蜜嗎？",
+        )
+    except Exception as e:
+        await update.message.reply_text("對不起，維尼走丟了。")
+        logging.error(f"Failed to send Pooh image: {e}")
+
+# ================= 新增彩蛋處理 =================
+
+#async def cat_egg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#    """彩蛋：發送 '51121' 回覆貓咪相關訊息"""
+#    log_command(update, "51121_EGG")
+
+#    await update.message.reply_text(
+#        "來來來 恭喜你找到了隱藏的貓咪指令！\n\n"
+#        "股市如貓，難以捉摸，但 MCB 可以幫你51121啊51121。\n"
+#        "https://youtu.be/IxX_QHay02M?si=f7Ep8pELP4iYFce9 \n\n"
+#        "別51121了 馬上上強度：/scan",
+#        parse_mode='Markdown',
+#        disable_web_page_preview=False 
+#    )
+
+# ================= 彩蛋處理 (使用 HTML 模式) =================
+
+async def cat_egg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """彩蛋：發送 '51121' 回覆貓咪相關訊息"""
+    log_command(update, "51121_EGG")
+
+    # 注意：這裡使用 HTML 標籤 <b>，並設置 parse_mode='HTML'
+    await update.message.reply_text(
+        "🐱 <b>喵喵！</b> 來來來 恭喜你找到了隱藏的貓咪指令！\n\n"
+        "股市如貓，難以捉摸，但 MCB 可以幫你51121啊51121。\n"
+        f"別51121了 馬上上強度：/scan\n\nhttps://youtu.be/IxX_QHay02M?si=f7Ep8pELP4iYFce9",
+        parse_mode='HTML' # 關鍵：改為 HTML
+    )
+
+    
+async def namewee_egg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """彩蛋：發送 '4896' 回覆黃明志歌曲連結"""
+    log_command(update, "4896_EGG")
+    
+    # 確保開啟網頁預覽，這樣 Telegram 會顯示 YouTube 預覽卡片
+    await update.message.reply_text(
+        "🎶 **你嫁給了別人 做別人的老婆～**\n\n"
+        "柴灣 北角 銅鑼灣\n"
+        "灣仔 中環 金鐘 尖沙咀\n"
+        "油麻地 旺角 太子 九龍塘\n"
+        "沙田 上水 羅湖 深圳 廣州 廈門\n"
+        "台北 福州 南京 上海 北京 中環... \n\n"
+        "https://youtu.be/w-Ol7vb6oCQ?si=IrewkOYwojpqit7x",
+        parse_mode='Markdown',
+        disable_web_page_preview=False 
+    )
+
+
+
+
+
+
+        
 
 async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
     """每日自動廣播任務"""
@@ -305,6 +371,14 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('scan', scan_now))
     application.add_handler(CommandHandler('stop', stop))
+    
+    # 註冊彩蛋指令 (MessageHandler)
+    # 1. 8964 彩蛋
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^8964$'), winnie_the_pooh))
+    # 2. 51121 彩蛋 (新增)
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^51121$'), cat_egg))
+    # 3. 4896 彩蛋 (新增)
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^4896$'), namewee_egg))
 
     # 設置每日定時任務 (需要 JobQueue 依賴)
     job_queue = application.job_queue
