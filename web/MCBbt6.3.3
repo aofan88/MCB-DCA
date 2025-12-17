@@ -1,0 +1,455 @@
+# ==========================================
+# 系統版本: RunSing Capital System v6.3.3 (Critical Fix)
+# 編寫時間: 2025-12-16
+# 
+# 主要改動:
+# 1. [緊急修復] XIRR 計算邏輯：刪除了錯誤的總額判斷，修復正收益顯示為 0 的 Bug。
+# 2. [優化] XIRR 算法：改為檢查資金流向 (必須有進有出)，確保 brentq 正常收斂。
+# 3. [保持] v6.3.2 的所有介面設定 (Tab1 顯示份數/評分, Tab2 顯示金額/成本線)。
+# ==========================================
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+from scipy import optimize
+
+# ==========================================
+# 0. 頁面配置
+# ==========================================
+st.set_page_config(page_title="RunSing | MCB v6.3.3", layout="wide", page_icon="🦁")
+
+st.title("🦁 RunSing Capital | MCB 智能囤股回測系統 v6.3.3")
+st.markdown("---")
+
+# ==========================================
+# 1. 側邊欄：策略參數
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ 策略核心參數")
+    symbol = st.text_input("主測股票代碼", value="WMT")
+    benchmark_symbol = st.text_input("對標資產 (同策略 PK)", value="QQQ")
+    unit_size = st.number_input("單筆買入金額 ($)", value=1000)
+    
+    st.divider()
+    st.subheader("指標參數")
+    wt_ch_len = st.number_input("Channel Length", value=9)
+    wt_avg_len = st.number_input("Average Length", value=12)
+    key_lvl_1 = st.slider("一倍買入閾值", -100, 0, -35)
+    key_lvl_2 = st.slider("兩倍買入閾值", -100, 0, -60)
+    
+    st.divider()
+    st.caption("Version: 6.3.3 (XIRR Fixed)")
+
+# ==========================================
+# 2. 計算核心 & 評分系統
+# ==========================================
+def calculate_xirr(transactions):
+    """
+    [已修復] 使用 brentq 算法計算 XIRR
+    修復點：移除了錯誤的 sum>=0 判斷，改為檢查是否有正負現金流
+    """
+    if not transactions or len(transactions) < 2: return 0.0
+    
+    # 按日期排序
+    transactions.sort(key=lambda x: x[0])
+    dates = [t[0] for t in transactions]
+    amounts = [t[1] for t in transactions]
+    
+    # 核心檢查：必須既有流出(買入負數) 也有流入(最終市值正數) 才能計算 IRR
+    has_pos = any(a > 0 for a in amounts)
+    has_neg = any(a < 0 for a in amounts)
+    if not (has_pos and has_neg): return 0.0
+    
+    start_date = dates[0]
+    days = [(d - start_date).days for d in dates]
+    
+    def xnpv(rate):
+        # 避免除零或無窮大
+        if rate <= -1.0: return float('inf')
+        return sum([a / ((1 + rate) ** (d / 365.0)) for a, d in zip(amounts, days)])
+    
+    try:
+        # 在 -99.9% 到 10000% 之間尋找零點
+        return optimize.brentq(xnpv, -0.9999, 100.0, maxiter=100) * 100
+    except:
+        return 0.0
+
+def calculate_metrics(returns_series, risk_free_rate=0.04):
+    """計算夏普、索提諾、波動率"""
+    if len(returns_series) < 2 or returns_series.std() == 0:
+        return 0.0, 0.0, 0.0
+    volatility = returns_series.std() * np.sqrt(252) * 100
+    excess_returns = returns_series - (risk_free_rate / 252)
+    sharpe = (excess_returns.mean() / returns_series.std()) * np.sqrt(252)
+    
+    downside = returns_series[returns_series < 0]
+    sortino = (excess_returns.mean() / downside.std()) * np.sqrt(252) if len(downside) > 0 and downside.std() != 0 else 0.0
+    return sharpe, sortino, volatility
+
+def calculate_max_drawdown(series):
+    """計算最大回撤"""
+    if len(series) < 1: return 0.0
+    s = pd.Series(series)
+    if (s <= 0).all(): return 0.0
+    running_max = s.cummax()
+    drawdown = (s - running_max) / running_max
+    return drawdown.min() * 100
+
+def calculate_runsing_score(res):
+    """RunSing 資產評分系統 (0-100分)"""
+    if not res: return 0
+    
+    # 1. 進攻分 (XIRR) - 權重 40 (年化25%滿分)
+    xirr = res.get('XIRR (%)', 0)
+    score_offense = min(40, max(0, (xirr / 25) * 40))
+    
+    # 2. 防守分 (MaxDD) - 權重 40 (回撤0%滿分, -50%零分)
+    mdd = abs(res.get('Max DD (%)', 0))
+    score_defense = max(0, 40 - (mdd / 50 * 40))
+    
+    # 3. 效率分 (Sharpe/Sortino) - 權重 20
+    score_eff = 0
+    sharpe = res.get('Sharpe', 0)
+    sortino = res.get('Sortino', 0)
+    
+    if sharpe >= 1.0: score_eff += 10
+    elif sharpe >= 0.5: score_eff += 5
+        
+    if sortino >= 1.5: score_eff += 10
+    elif sortino >= 1.0: score_eff += 5
+    
+    return int(score_offense + score_defense + score_eff)
+
+@st.cache_data
+def get_data(ticker):
+    try:
+        df = yf.download(ticker, start="1995-01-01", progress=False, auto_adjust=False)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[['Open', 'High', 'Low', 'Close']].copy()
+        df = df.ffill().bfill()
+        
+        ap = (df['High'] + df['Low'] + df['Close']) / 3
+        esa = ap.ewm(span=wt_ch_len, adjust=False).mean()
+        d = (ap - esa).abs().ewm(span=wt_ch_len, adjust=False).mean()
+        ci = (ap - esa) / (0.015 * d)
+        wt1 = ci.ewm(span=wt_avg_len, adjust=False).mean()
+        wt2 = wt1.rolling(window=3).mean()
+        
+        df['WT1'] = wt1
+        df['WT2'] = wt2
+        return df
+    except Exception as e:
+        return None
+
+def run_simulation(df, start_date, end_date=None):
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date) if end_date else df.index[-1]
+    df_test = df[(df.index >= start_dt) & (df.index <= end_dt)].copy()
+    if len(df_test) < 10: return None
+    df_test['Daily_Ret'] = df_test['Close'].pct_change().fillna(0)
+    
+    holdings = 0
+    total_invested = 0
+    total_units = 0
+    cash_flows = []
+    buy_signals = []
+    equity_curve = []
+    avg_cost_curve = []
+    active_returns = []
+    
+    for i in range(1, len(df_test) - 1):
+        wt1_p = df_test['WT1'].iloc[i-1]
+        wt2_p = df_test['WT2'].iloc[i-1]
+        wt1_c = df_test['WT1'].iloc[i]
+        wt2_c = df_test['WT2'].iloc[i]
+        
+        crossover = (wt1_p <= wt2_p) and (wt1_c > wt2_c)
+        mult = 0
+        if crossover:
+            if wt1_c <= key_lvl_2: mult = 2
+            elif wt1_c <= key_lvl_1: mult = 1
+        
+        current_date = df_test.index[i+1]
+        current_open = df_test['Open'].iloc[i+1]
+        current_close = df_test['Close'].iloc[i+1]
+        
+        if mult > 0:
+            cost = unit_size * mult
+            shares = cost / current_open
+            holdings += shares
+            total_invested += cost
+            total_units += mult
+            
+            cash_flows.append((current_date, -cost))
+            buy_signals.append({
+                'Date': current_date,
+                'Price': current_open,
+                'Units': mult,
+                'Cost': cost
+            })
+            
+        current_value = holdings * current_close
+        equity_curve.append(current_value)
+        avg_cost = (total_invested / holdings) if holdings > 0 else None
+        avg_cost_curve.append(avg_cost)
+        
+        if holdings > 0:
+            active_returns.append(df_test['Daily_Ret'].iloc[i+1])
+
+    last_price = df_test['Close'].iloc[-1]
+    final_val = holdings * last_price
+    
+    if total_invested == 0: return None
+    
+    # 補上最後一筆現金流 (市值) 用於計算 XIRR
+    cash_flows.append((df_test.index[-1], final_val))
+    
+    res_xirr = calculate_xirr(cash_flows)
+    total_profit = final_val - total_invested
+    roi = (total_profit / total_invested) * 100
+    sharpe, sortino, volatility = calculate_metrics(pd.Series(active_returns))
+    max_dd = calculate_max_drawdown(equity_curve)
+    
+    # DCA 對比計算
+    monthly_groups = df_test.resample('MS').first()
+    dca_roi = 0.0
+    if len(monthly_groups) > 0:
+        monthly_amt = total_invested / len(monthly_groups)
+        dca_shares = 0
+        dca_inv = 0
+        for _, row in monthly_groups.iterrows():
+            if pd.isna(row['Open']): continue
+            dca_shares += monthly_amt / row['Open']
+            dca_inv += monthly_amt
+        dca_final = dca_shares * last_price
+        dca_roi = ((dca_final - dca_inv) / dca_inv * 100) if dca_inv > 0 else 0.0
+
+    return {
+        "Period": f"{start_dt.strftime('%Y-%m')} ~ {end_dt.strftime('%Y-%m')}",
+        "Invested": total_invested,
+        "Final Value": final_val,
+        "Profit": total_profit,
+        "ROI (%)": roi,
+        "DCA ROI (%)": dca_roi,
+        "XIRR (%)": res_xirr,
+        "Max DD (%)": max_dd,
+        "Sharpe": sharpe,
+        "Sortino": sortino,
+        "Volatility (%)": volatility,
+        "Total Units": total_units,
+        "Buy Signals": buy_signals,
+        "DataFrame": df_test,
+        "Avg Cost Curve": avg_cost_curve
+    }
+
+# ==========================================
+# 3. 劇本定義
+# ==========================================
+SCENARIOS = [
+    {"name": "📚 歷史全週期", "start": "1995-01-01", "end": datetime.now().strftime('%Y-%m-%d')},
+    {"name": "📉 互聯網泡沫", "start": "2000-03-24", "end": "2002-10-09"},
+    {"name": "🌊 金融海嘯", "start": "2007-10-01", "end": "2009-03-09"},
+    {"name": "🐢 美股失落十年", "start": "2000-01-01", "end": "2013-01-01"},
+    {"name": "😴 2015-2016 盤整", "start": "2015-01-01", "end": "2016-12-31"},
+    {"name": "🦠 新冠熔斷 V轉", "start": "2020-02-01", "end": "2020-08-31"},
+    {"name": "🚀 2021至今", "start": "2021-01-01", "end": datetime.now().strftime('%Y-%m-%d')},
+]
+
+# ==========================================
+# 4. 主程式邏輯
+# ==========================================
+full_df = get_data(symbol)
+bench_df = get_data(benchmark_symbol) if benchmark_symbol else None
+
+if full_df is not None:
+    
+    tab1, tab2 = st.tabs(["📊 歷史週期評分 (Overview)", "🛠️ 自定義詳細回測 (Deep Dive)"])
+    
+    # ==================================================
+    # TAB 1: 歷史週期報告 (含評分系統)
+    # ==================================================
+    with tab1:
+        st.subheader(f"📝 {symbol} 資產體檢與評分報告")
+        st.caption(f"RS 評分說明：綜合考慮『XIRR (進攻)』、『最大回撤 (防守)』與『夏普比率 (效率)』。滿分100，80分以上為優質資產。")
+        
+        # 可選欄位 (Tab 1 移除「總投入」)
+        all_cols = ["累計份數", "ROI (%)", "對標 ROI", "DCA ROI (%)", "XIRR (%)", "最大回撤", "夏普", "索提諾", "波動率"]
+        default_cols = ["累計份數", "ROI (%)", "對標 ROI", "DCA ROI (%)", "XIRR (%)", "最大回撤", "夏普", "索提諾", "波動率"]
+        selected_cols = st.multiselect("選擇展示數據:", all_cols, default=default_cols)
+        
+        results_list = []
+        my_bar = st.progress(0)
+        
+        for idx, sc in enumerate(SCENARIOS):
+            res_main = run_simulation(full_df, sc["start"], sc["end"])
+            res_bench = None
+            if bench_df is not None:
+                res_bench = run_simulation(bench_df, sc["start"], sc["end"])
+
+            if res_main:
+                # 計算評分
+                rs_score = calculate_runsing_score(res_main)
+                bench_roi_str = f"{res_bench['ROI (%)']:.1f}%" if res_bench else "N/A"
+                
+                # 建構基礎數據
+                row_data = {
+                    "劇本場景": sc["name"],
+                    "時間範圍": res_main["Period"],
+                    "RS 評分": rs_score,
+                }
+                
+                # 建構可選數據
+                raw_data = {
+                    "累計份數": res_main['Total Units'],
+                    "ROI (%)": f"{res_main['ROI (%)']:.1f}%",
+                    "對標 ROI": bench_roi_str,
+                    "DCA ROI (%)": f"{res_main['DCA ROI (%)']:.1f}%",
+                    "XIRR (%)": f"{res_main['XIRR (%)']:.2f}%",
+                    "最大回撤": f"{res_main['Max DD (%)']:.2f}%",
+                    "夏普": f"{res_main['Sharpe']:.2f}",
+                    "索提諾": f"{res_main['Sortino']:.2f}",
+                    "波動率": f"{res_main['Volatility (%)']:.1f}%"
+                }
+                
+                # 只加入使用者選的
+                for col in selected_cols:
+                    row_data[col] = raw_data[col]
+                
+                results_list.append(row_data)
+                
+            my_bar.progress((idx + 1) / len(SCENARIOS))
+        my_bar.empty()
+        
+        if results_list:
+            df_res = pd.DataFrame(results_list)
+            # 讓 RS 評分排在前面
+            cols_order = ["劇本場景", "時間範圍", "RS 評分"] + [c for c in selected_cols]
+            st.dataframe(df_res[cols_order], use_container_width=True, height=500)
+
+    # ==================================================
+    # TAB 2: 自定義詳細回測
+    # ==================================================
+    with tab2:
+        col_ctrl, col_chart = st.columns([1, 4])
+        
+        with col_ctrl:
+            st.markdown("### ⏳ 時間與設置")
+            min_date = full_df.index[0].date()
+            max_date = full_df.index[-1].date()
+            default_start = max(min_date, datetime.now().date() - timedelta(days=365*5))
+            
+            start_input = st.date_input("開始日期", value=default_start, min_value=min_date, max_value=max_date)
+            end_input = st.date_input("結束日期", value=max_date, min_value=min_date, max_value=max_date)
+            
+            st.divider()
+            st.markdown("### 🎨 圖表選項")
+            show_cost = st.checkbox("顯示平均成本線", value=True)
+            log_scale = st.checkbox("使用對數坐標 (Log)", value=False)
+            
+            sim_res = None
+            bench_res = None
+            if start_input < end_input:
+                sim_res = run_simulation(full_df, start_input, end_input)
+                if bench_df is not None:
+                    bench_res = run_simulation(bench_df, start_input, end_input)
+
+        with col_chart:
+            if sim_res:
+                df_period = sim_res['DataFrame']
+                
+                # 計算該週期的評分
+                period_score = calculate_runsing_score(sim_res)
+
+                # 1. 儀表板 (Tab 2 移除「累計份數」)
+                st.markdown(f"#### 📊 策略深度面板 (本週期 RS 評分: :red[{period_score} 分])")
+                
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("💰 總投入本金", f"${sim_res['Invested']:,.0f}")
+                m2.metric("💵 最終資產市值", f"${sim_res['Final Value']:,.0f}", delta=f"${sim_res['Profit']:,.0f}")
+                m3.metric("🚀 策略 ROI", f"{sim_res['ROI (%)']:.1f}%")
+                m4.metric("🛡️ 平均持倉成本", f"${sim_res['Avg Cost Curve'][-1]:.2f}")
+
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("📅 XIRR (真實年化)", f"{sim_res['XIRR (%)']:.2f}%")
+                r2.metric("📉 最大回撤", f"-{sim_res['Max DD (%)']:.2f}%")
+                dca_gap = sim_res['ROI (%)'] - sim_res['DCA ROI (%)']
+                r3.metric("🆚 定投 (DCA) 差距", f"{sim_res['DCA ROI (%)']:.1f}%", delta=f"{dca_gap:.1f}%")
+                r4.metric("🎲 交易次數", f"{len(sim_res['Buy Signals'])}")
+
+                st.divider()
+
+                # 2. 對標數據區
+                if bench_res:
+                    st.caption(f"💡 對標參考: {benchmark_symbol}")
+                    b1, b2, b3, b4 = st.columns(4)
+                    diff_roi = sim_res['ROI (%)'] - bench_res['ROI (%)']
+                    b1.metric(f"{benchmark_symbol} ROI", f"{bench_res['ROI (%)']:.1f}%", delta=f"{diff_roi:.1f}% (Alpha)")
+                    b2.metric(f"{benchmark_symbol} XIRR", f"{bench_res['XIRR (%)']:.2f}%")
+                    b3.metric(f"{benchmark_symbol} Max DD", f"-{bench_res['Max DD (%)']:.2f}%")
+                    b4.metric(f"{benchmark_symbol} Sharpe", f"{bench_res['Sharpe']:.2f}")
+
+                # 3. 圖表
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # 主資產
+                fig.add_trace(go.Scatter(
+                    x=df_period.index, y=df_period['Close'],
+                    mode='lines', name=f'{symbol} 股價',
+                    line=dict(color='#bdc3c7', width=1)
+                ), secondary_y=False)
+
+                # 成本線
+                if show_cost:
+                    fig.add_trace(go.Scatter(
+                        x=df_period.index[1:], y=sim_res['Avg Cost Curve'],
+                        mode='lines', name='您的持倉成本',
+                        line=dict(color='#f39c12', width=2, dash='dash')
+                    ), secondary_y=False)
+
+                # 買點
+                buys = sim_res['Buy Signals']
+                if buys:
+                    b_dates = [b['Date'] for b in buys]
+                    b_prices = [b['Price'] for b in buys]
+                    fig.add_trace(go.Scatter(
+                        x=b_dates, y=b_prices,
+                        mode='markers', name='策略買入',
+                        marker=dict(symbol='triangle-up', size=10, color='#00CC96', line=dict(width=1, color='white')),
+                        text=[f"買入{b['Units']}份" for b in buys]
+                    ), secondary_y=False)
+
+                # 對標資產
+                if bench_res:
+                    df_bench = bench_res['DataFrame']
+                    fig.add_trace(go.Scatter(
+                        x=df_bench.index, y=df_bench['Close'],
+                        mode='lines', name=f'{benchmark_symbol} (同策略)',
+                        line=dict(color='#9b59b6', width=1.5, dash='dot')
+                    ), secondary_y=True)
+
+                fig.update_layout(
+                    title=f"策略可視化: {start_input} ~ {end_input}",
+                    height=600,
+                    template="plotly_dark",
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=10, r=10, t=50, b=10)
+                )
+                
+                y_type = "log" if log_scale else "linear"
+                fig.update_yaxes(title_text=f"{symbol} 價格", type=y_type, secondary_y=False)
+                fig.update_yaxes(title_text=f"{benchmark_symbol} 價格", type=y_type, secondary_y=True, showgrid=False)
+
+                st.plotly_chart(fig, use_container_width=True)
+                
+                with st.expander("查看詳細交易記錄"):
+                    st.dataframe(pd.DataFrame(buys), use_container_width=True)
+
+            else:
+                st.warning("⚠️ 該區間內無數據或不足以進行回測，請調整日期。")
