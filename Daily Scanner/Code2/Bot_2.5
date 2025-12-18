@@ -6,8 +6,8 @@ import pytz
 from datetime import datetime, time, timedelta
 
 #=================
-# TGBot_2.3.1 帶彩蛋
-# 基本功能沒問題 資產還需要修改 並未篩選完成
+# TGBot_2.5 帶彩蛋 Dec/18/2025
+# 基本功能沒問題 資產已經修改好 並加了權重功能
 # 等待發掘更多功能
 #=================
 
@@ -183,7 +183,7 @@ def run_scan_logic():
 
     # 生成報告文本
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-    report = f"📊 <b>RunSing</b>-MCB Scanner Report_Bot2.3\n"
+    report = f"📊 <b>RunSing</b>-MCB Scanner Report_Bot2.5\n"
     report += f"🕒 Generated at: {current_time}\n\n"
 
     if not all_signals:
