@@ -1,0 +1,410 @@
+import logging
+import json
+import os
+import asyncio
+import pytz 
+import secrets
+from datetime import datetime, time, timedelta
+from itertools import groupby
+
+# 數據與計算庫
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+# Telegram Bot 庫 (v20+)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters 
+
+# 配置日誌
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# ================= 配置區域 (請修改這裡) =================
+
+# 1. Telegram 設定
+TG_BOT_TOKEN = '8074680946:AAFshgFINNVlVYJFl88-E9z_o8Zj-KsfRSs' 
+ADMIN_ID = 6027645130  # ⚠️ 必須修改：填入老闆您的 TG ID (數字)
+
+# 2. 交易核心參數 (RunSing Capital)
+BASE_UNIT = 40          # 基礎金額 $40
+BROKER_NAME = "Firstrade" # 指定券商
+VIP_LOOKBACK_DAYS = 3   # VIP 補單回溯天數
+
+# 3. 資產配置與權重
+TICKERS = [
+    'GOOGL', 'NVDA', 'LLY', 'WMT', 'AVGO', # Core
+    'META', 'COST', 'CAT', 'QQQ', 'AAPL',  # Standard
+    'TQQQ', 'TSLA', 'TSM', 'MSTR', 'IBIT'  # Aggressive
+]
+
+# 資產屬性字典 (用於 VIP 計算)
+ASSET_INFO = {
+    # --- Core 重炮 (3x) ---
+    'GOOGL': {'level': 'Core', 'weight': 3},
+    'NVDA':  {'level': 'Core', 'weight': 3},
+    'LLY':   {'level': 'Core', 'weight': 3},
+    'WMT':   {'level': 'Core', 'weight': 3},
+    'AVGO':  {'level': 'Core', 'weight': 3},
+    
+    # --- Standard 中堅 (2x) ---
+    'META':  {'level': 'Standard', 'weight': 2},
+    'COST':  {'level': 'Standard', 'weight': 2},
+    'CAT':   {'level': 'Standard', 'weight': 2},
+    'QQQ':   {'level': 'Standard', 'weight': 2},
+    'AAPL':  {'level': 'Standard', 'weight': 2},
+    
+    # --- Aggressive 博弈 (1x) ---
+    'TQQQ':  {'level': 'Aggressive', 'weight': 1},
+    'TSLA':  {'level': 'Aggressive', 'weight': 1},
+    'TSM':   {'level': 'Aggressive', 'weight': 1},
+    'MSTR':  {'level': 'Aggressive', 'weight': 1},
+    'IBIT':  {'level': 'Aggressive', 'weight': 1}
+}
+
+# 4. 策略與系統參數
+N1 = 9; N2 = 12
+LEVEL_1_BUY = -35
+LEVEL_2_BUY = -60
+LOOKBACK_DAYS = 7
+DATA_FILE = "runsing_data.json"
+SCAN_COOLDOWN_SECONDS = 60
+
+# 5. 彩蛋 URL
+WINNIE_POOH_URL = "https://i.ibb.co/DDDVRp2r/IMG-5226.jpg"
+
+# ================= 全局變數 =================
+LAST_SCAN_TIME = {} 
+
+# ================= 數據管理 (Data Manager) =================
+
+def load_data():
+    """加載數據庫"""
+    if not os.path.exists(DATA_FILE):
+        return {"subscribers": [], "vip_users": [], "active_keys": {}}
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, list): 
+                return {"subscribers": data, "vip_users": [], "active_keys": {}}
+            return data
+    except Exception as e:
+        logging.error(f"數據加載失敗: {e}")
+        return {"subscribers": [], "vip_users": [], "active_keys": {}}
+
+def save_data(data):
+    """保存數據庫"""
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def is_vip(user_id):
+    """檢查 VIP 身份"""
+    data = load_data()
+    return user_id in data.get("vip_users", [])
+
+def add_subscriber(user_id):
+    data = load_data()
+    if user_id not in data["subscribers"]:
+        data["subscribers"].append(user_id)
+        save_data(data)
+
+def remove_subscriber(user_id):
+    data = load_data()
+    if user_id in data["subscribers"]:
+        data["subscribers"].remove(user_id)
+        save_data(data)
+
+# ================= VIP 計算核心 =================
+
+def calculate_vip_order(ticker, action_str):
+    """計算下單金額: Base * Weight * Mult"""
+    signal_mult = 2 if "2×" in action_str else 1
+    info = ASSET_INFO.get(ticker, {'level': 'Unknown', 'weight': 1})
+    weight = info['weight']
+    level = info['level']
+    final_amount = BASE_UNIT * weight * signal_mult
+    return final_amount, level, weight, signal_mult
+
+def format_vip_message(vip_pack):
+    """生成 VIP 專屬詳細報告 (v3.3 最終版)"""
+    today_list = vip_pack.get('today', [])
+    recent_list = vip_pack.get('recent', [])
+    
+    if not today_list and not recent_list:
+        return None
+
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    msg = "👑 <b>RunSing VIP 執行指令</b>\n"
+    msg += f"📅 {current_date}\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    
+    # --- 第一部分：今日信號 (TODAY) ---
+    if today_list:
+        msg += "\n🚨 <b>今日信號 (TODAY)</b>\n"
+        for s in today_list:
+            amount, level, weight, mult = calculate_vip_order(s['ticker'], s['action'])
+            
+            msg += f"🎯 <b>{s['ticker']}</b> ({level})\n"
+            msg += f"💰 <b>買入: ${amount}</b>\n"
+            # 修改點：改為「收盤價」
+            msg += f"📊 收盤價: ${s['price']:.2f} | WT:{s['mcb_val']:.1f}\n"
+            msg += "------------------\n"
+    
+    # --- 第二部分：近期補救 (RECENT) ---
+    if recent_list:
+        msg += "\n⏳ <b>近期漏單補救 (RECENT)</b>\n"
+        msg += "<i>若之前漏操作，可參考以下：</i>\n"
+        for s in recent_list:
+            amount, level, _, _ = calculate_vip_order(s['ticker'], s['action'])
+            # 格式：• 2025-12-24 AAPL: 需買 $80 (當時價 $273.81)
+            msg += f"• {s['date']} <b>{s['ticker']}</b>: 需買 <b>${amount}</b>\n"
+            msg += f"  (收盤價 ${s['price']:.2f})\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    # 修改點：刪除了「今日需入金」統計行
+    msg += f"🚀 請打開 {BROKER_NAME} 下單。"
+    return msg
+
+# ================= 核心掃描邏輯 =================
+
+def calculate_mcb(df, n1=9, n2=12):
+    """計算 MCB 技術指標"""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    source = (df['High'] + df['Low'] + df['Close']) / 3
+    esa = source.ewm(span=n1, adjust=False).mean() 
+    d = (source - esa).abs().ewm(span=n1, adjust=False).mean()
+    ci = (source - esa) / (0.015 * d.replace(0, 0.00001))
+    wt1 = ci.ewm(span=n2, adjust=False).mean() 
+    wt2 = wt1.rolling(window=3).mean()
+    df['wt1'] = wt1; df['wt2'] = wt2
+    return df
+
+def run_scan_logic():
+    """執行掃描 (v3.3 交易日邏輯版)"""
+    all_signals = []
+    
+    for ticker in TICKERS:
+        try:
+            df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=False)
+            if len(df) < 50: continue
+            
+            df = calculate_mcb(df, N1, N2)
+            check_range = df.iloc[-(LOOKBACK_DAYS + 1):]
+            
+            for i in range(1, len(check_range)):
+                curr = check_range.iloc[i]
+                prev = check_range.iloc[i-1]
+                if (prev['wt1'] < prev['wt2']) and (curr['wt1'] >= curr['wt2']):
+                    val = curr['wt1']
+                    action = ""
+                    if val < LEVEL_2_BUY: action = "2× Buy"
+                    elif val < LEVEL_1_BUY: action = "1× Buy"
+                    
+                    if action:
+                        all_signals.append({
+                            'ticker': ticker,
+                            'date': curr.name.strftime('%Y-%m-%d'),
+                            'price': curr['Close'],
+                            'mcb_val': val,
+                            'action': action
+                        })
+        except Exception:
+            continue
+
+    # --- 生成報告與分組邏輯 ---
+    current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    public_report = f"📊 <b>RunSing</b>-MCB Scanner v3.3\n🕒 {current_time_str}\n\n"
+    vip_signals_pack = {'today': [], 'recent': []}
+
+    if not all_signals:
+        public_report += "😴 <b>NO SIGNALS</b>\n近期無操作信號。"
+        return public_report, vip_signals_pack
+
+    all_signals.sort(key=lambda x: x['date'], reverse=True)
+    
+    # 🌟 邏輯修正：取數據源裡「最新的一個日期」作為 Today
+    # 這樣週一掃描時，週五的信號就會是 Today
+    latest_data_date = all_signals[0]['date']
+    
+    today_group = [s for s in all_signals if s['date'] == latest_data_date]
+    past_group = [s for s in all_signals if s['date'] != latest_data_date]
+
+    # 填充 VIP 數據包
+    vip_signals_pack['today'] = today_group
+    
+    # VIP 回溯 (以最新交易日為基準，往前推 N 天)
+    limit_date = (datetime.strptime(latest_data_date, '%Y-%m-%d') - timedelta(days=VIP_LOOKBACK_DAYS)).date()
+    
+    for s in past_group:
+        if datetime.strptime(s['date'], '%Y-%m-%d').date() >= limit_date:
+            vip_signals_pack['recent'].append(s)
+
+    # --- 生成普通報告文本 ---
+    
+    # A. 最新信號 (詳細：含 WT)
+    public_report += "━━━━━━━━━━━━━\n🔥 <b>NEW SIGNAL</b>\n━━━━━━━━━━━━━\n"
+    for s in today_group:
+        public_report += f"• <b>{s['ticker']}</b> — {s['action']}\n  Date: {s['date']}\n  Price: ${s['price']:.2f} | WT: {s['mcb_val']:.1f}\n\n"
+
+    # B. 過去信號 (精簡：無 WT)
+    if past_group:
+        public_report += "━━━━━━━━━━━━━\n📅 <b>PAST SIGNALS</b>\n━━━━━━━━━━━━━\n"
+        for date, group in groupby(past_group, key=lambda x: x['date']):
+            public_report += f"{date}\n"
+            for s in group:
+                short_action = s['action'].split(' ')[0] # "1× Buy" -> "1×"
+                public_report += f"• {s['ticker']} ({short_action}) @ ${s['price']:.2f}\n"
+            public_report += "\n"
+            
+    public_report += "━━━━━━━━━━━━━\n🤖 價格僅供參考，VIP 請查看指令。"
+    return public_report, vip_signals_pack
+
+# ================= Bot 指令處理 =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    add_subscriber(user_id)
+    vip_status = "👑 VIP 用戶" if is_vip(user_id) else "👤 普通用戶"
+    
+    await update.message.reply_text(
+        f"✅ **RunSing Capital v3.3**\n"
+        f"您的身份：{vip_status}\n\n"
+        "功能菜單：\n"
+        "• /scan - 立即掃描\n"
+        "• /vip <卡密> - 激活 VIP\n"
+        "• /myid - 查詢 ID\n"
+        "• /stop - 停止訂閱",
+        parse_mode='Markdown'
+    )
+
+async def get_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"您的 ID: `{update.effective_chat.id}`", parse_mode='Markdown')
+
+async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    if user_id in LAST_SCAN_TIME:
+        diff = (datetime.now() - LAST_SCAN_TIME[user_id]).total_seconds()
+        if diff < SCAN_COOLDOWN_SECONDS:
+            await update.message.reply_text(f"⏳ 冷卻中... 請等待 {int(SCAN_COOLDOWN_SECONDS - diff)} 秒")
+            return
+    LAST_SCAN_TIME[user_id] = datetime.now()
+
+    await update.message.reply_text("🔍 正在掃描全市場...")
+    
+    loop = asyncio.get_running_loop()
+    public_msg, vip_pack = await loop.run_in_executor(None, run_scan_logic)
+
+    if is_vip(user_id):
+        await update.message.reply_text(public_msg, parse_mode='HTML')
+        vip_msg = format_vip_message(vip_pack)
+        if vip_msg:
+            await update.message.reply_text(vip_msg, parse_mode='HTML')
+        else:
+            await update.message.reply_text("👑 VIP 提示：近期無新信號。", parse_mode='HTML')
+    else:
+        await update.message.reply_text(public_msg, parse_mode='HTML')
+        if vip_pack['today'] or vip_pack['recent']:
+             await update.message.reply_text("🔒 <b>VIP 內容已隱藏</b>\n輸入 /vip 獲取具體下單金額。", parse_mode='HTML')
+
+# --- 卡密指令 ---
+async def gen_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_ID: return
+    key = "VIP-" + secrets.token_hex(4).upper()
+    data = load_data()
+    data["active_keys"][key] = 365
+    save_data(data)
+    await update.message.reply_text(f"🔑 新卡密：\n`{key}`", parse_mode='Markdown')
+
+async def redeem_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: key = context.args[0]
+    except: 
+        await update.message.reply_text("用法：`/vip 卡密`", parse_mode='Markdown')
+        return
+    data = load_data()
+    if key in data["active_keys"]:
+        if update.effective_chat.id not in data["vip_users"]:
+            data["vip_users"].append(update.effective_chat.id)
+        del data["active_keys"][key]
+        save_data(data)
+        await update.message.reply_text("🎉 **VIP 激活成功！**", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ 卡密無效")
+
+# --- 定時任務函數 ---
+async def daily_broadcast_morning(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("⏰ [06:00] 早報廣播...")
+    data = load_data()
+    if not data["subscribers"]: return
+    loop = asyncio.get_running_loop()
+    public_msg, vip_pack = await loop.run_in_executor(None, run_scan_logic)
+    vip_msg = format_vip_message(vip_pack)
+
+    for uid in data["subscribers"]:
+        try:
+            await context.bot.send_message(uid, public_msg, parse_mode='HTML', disable_web_page_preview=True)
+            if is_vip(uid) and vip_msg:
+                await context.bot.send_message(uid, vip_msg, parse_mode='HTML')
+        except Exception as e:
+            logging.error(f"早報失敗 {uid}: {e}")
+
+async def vip_evening_reminder(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("⏰ [21:00] VIP 盤前提醒...")
+    data = load_data()
+    if not data["vip_users"]: return
+    loop = asyncio.get_running_loop()
+    _, vip_pack = await loop.run_in_executor(None, run_scan_logic)
+    vip_msg = format_vip_message(vip_pack)
+    
+    if not vip_msg: return
+
+    final_msg = "🔔 <b>美股盤前提醒 (21:00)</b>\n" + vip_msg
+    for uid in data["vip_users"]:
+        try:
+            await context.bot.send_message(uid, final_msg, parse_mode='HTML')
+        except Exception as e:
+            logging.error(f"盤前失敗 {uid}: {e}")
+
+# --- 彩蛋與其他 ---
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remove_subscriber(update.effective_chat.id)
+    await update.message.reply_text("❌ 已停止訂閱")
+
+async def egg_8964(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_photo(update.effective_chat.id, WINNIE_POOH_URL, caption="🍯")
+
+async def egg_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🐱 <b>喵喵！</b> /scan 起來！", parse_mode='HTML')
+
+async def egg_namewee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎶 <b>4896</b>\nhttps://youtu.be/w-Ol7vb6oCQ", parse_mode='HTML')
+
+# ================= 主程序 =================
+
+if __name__ == '__main__':
+    application = ApplicationBuilder().token(TG_BOT_TOKEN).build()
+
+    # 指令註冊
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('scan', scan_now))
+    application.add_handler(CommandHandler('stop', stop))
+    application.add_handler(CommandHandler('myid', get_my_id))
+    application.add_handler(CommandHandler('genkey', gen_key))
+    application.add_handler(CommandHandler('vip', redeem_vip))
+
+    # 彩蛋註冊
+    application.add_handler(MessageHandler(filters.Regex('^8964$'), egg_8964))
+    application.add_handler(MessageHandler(filters.Regex('^51121$'), egg_cat))
+    application.add_handler(MessageHandler(filters.Regex('^4896$'), egg_namewee))
+
+    # 定時任務 (UTC時間轉換)
+    if application.job_queue:
+        # 北京 06:00 = UTC 前一天 22:00
+        time_morning = time(hour=22, minute=0, tzinfo=pytz.utc)
+        application.job_queue.run_daily(daily_broadcast_morning, time=time_morning)
+        
+        # 北京 21:00 = UTC 當天 13:00
+        time_evening = time(hour=13, minute=0, tzinfo=pytz.utc)
+        application.job_queue.run_daily(vip_evening_reminder, time=time_evening)
+
+    print("🚀 RunSing Bot v3.3 (Perfect Logic) 已啟動...")
+    application.run_polling()
